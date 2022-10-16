@@ -35,6 +35,8 @@
 #include "factors/reprojection_factor.h"
 #include "factors/residual_block_info.h"
 #include "preintegration/imu_error_factor.h"
+#include "preintegration/imu_mix_prior_factor.h"
+#include "preintegration/imu_pose_prior_factor.h"
 #include "preintegration/preintegration.h"
 #include "preintegration/preintegration_factor.h"
 
@@ -81,8 +83,8 @@ GVINS::GVINS(const string &configfile, const string &outputpath, Drawer::Ptr dra
 
     // 安装参数
     // Installation parameters
-    vecdata    = config["antlever"].as<std::vector<double>>();
-    antlever_  = Vector3d(vecdata.data());
+    vecdata   = config["antlever"].as<std::vector<double>>();
+    antlever_ = Vector3d(vecdata.data());
 
     // IMU噪声参数
     // IMU parameters
@@ -97,7 +99,7 @@ GVINS::GVINS(const string &configfile, const string &outputpath, Drawer::Ptr dra
     integration_config_.iswithearth = config["iswithearth"].as<bool>();
     integration_config_.isuseodo    = false;
     integration_config_.iswithscale = false;
-    integration_config_.gravity     = {0, 0, NORMAL_GRAVITY};
+    integration_config_.gravity     = {0, 0, integration_parameters_->gravity};
 
     // 初始值, 后续根据GNSS定位实时更新
     // GNSS variables intializaiton
@@ -603,6 +605,8 @@ bool GVINS::gvinsInitialization() {
     vector<double> average;
     static Vector3d bg{0, 0, 0};
     static Vector3d initatt{0, 0, 0};
+    static bool is_has_zero_velocity = false;
+
     bool is_zero_velocity = MISC::detectZeroVelocity(imu_buff, imudatarate_, average);
     if (is_zero_velocity) {
         // 陀螺零偏
@@ -618,6 +622,7 @@ bool GVINS::gvinsInitialization() {
 
         LOGI << "Zero velocity get gyroscope bias " << bg.transpose() * 3600 * R2D << ", roll " << initatt[0] * R2D
              << ", pitch " << initatt[1] * R2D;
+        is_has_zero_velocity = true;
     }
 
     // 里程计速度大于MINMUM_ALIGN_VELOCITY, 或者非零速状态
@@ -632,8 +637,14 @@ bool GVINS::gvinsInitialization() {
             if (velocity.norm() < MINMUM_ALIGN_VELOCITY) {
                 return false;
             }
+
+            if (!is_has_zero_velocity) {
+                initatt[0] = 0;
+                initatt[1] = atan(-velocity.z() / sqrt(velocity.x() * velocity.x() + velocity.y() * velocity.y()));
+                LOGI << "Initialized pitch from GNSS as " << initatt[1] * R2D << " deg";
+            }
             initatt[2] = atan2(velocity.y(), velocity.x());
-            LOGI << "Initialized heading from GNSS positioning as " << initatt[2] * R2D << " deg";
+            LOGI << "Initialized heading from GNSS as " << initatt[2] * R2D << " deg";
         }
     } else {
         return false;
@@ -655,6 +666,7 @@ bool GVINS::gvinsInitialization() {
     statedatalist_.emplace_back(Preintegration::stateToData(state, preintegration_options_));
     gnsslist_.push_back(last_gnss_);
     timelist_.push_back(last_gnss_.time);
+    constructPrior(is_has_zero_velocity);
 
     // 初始化重力和地球自转参数
     // The gravity and the Earth rotation rate
@@ -1202,7 +1214,7 @@ bool GVINS::gvinsOptimization() {
         iterations_[1] = summary.num_successful_steps;
         timecosts_[1]  = timecost.costInMillisecond();
 
-        if (map_->isMaximumKeframes()) {
+        if (!map_->isMaximumKeframes()) {
             // 进行必要的重积分
             // Reintegration during initialization
             doReintegration();
@@ -1512,6 +1524,22 @@ bool GVINS::gvinsMarginalization() {
                                   statedatalist_[k + 1].mix},
             marg_index);
         marginalization_info->addResidualBlockInfo(residual);
+    }
+
+    // 先验约束因子
+    // The prior factor
+    if (is_use_prior_) {
+        auto pose_factor   = std::make_shared<ImuPosePriorFactor>(pose_prior_, pose_prior_std_);
+        auto pose_residual = std::make_shared<ResidualBlockInfo>(
+            pose_factor, nullptr, std::vector<double *>{statedatalist_[0].pose}, vector<int>{0});
+        marginalization_info->addResidualBlockInfo(pose_residual);
+
+        auto mix_factor   = std::make_shared<ImuMixPriorFactor>(preintegration_options_, mix_prior_, mix_prior_std_);
+        auto mix_residual = std::make_shared<ResidualBlockInfo>(
+            mix_factor, nullptr, std::vector<double *>{statedatalist_[0].mix}, vector<int>{0});
+        marginalization_info->addResidualBlockInfo(mix_residual);
+
+        is_use_prior_ = false;
     }
 
     // 重投影因子, 最老的关键帧
@@ -1840,8 +1868,18 @@ void GVINS::addImuFactors(ceres::Problem &problem) {
 
     // 添加IMU误差约束, 限制过大的误差估计
     // IMU error factor
-    auto factor = new ImuErrorFactor(preintegrationlist_.back());
+    auto factor = new ImuErrorFactor(preintegration_options_);
     problem.AddResidualBlock(factor, nullptr, statedatalist_[preintegrationlist_.size()].mix);
+
+    // IMU初始先验因子, 仅限于初始化
+    // IMU prior factor, only for initialization
+    if (is_use_prior_) {
+        auto pose_factor = new ImuPosePriorFactor(pose_prior_, pose_prior_std_);
+        problem.AddResidualBlock(pose_factor, nullptr, statedatalist_[0].pose);
+
+        auto mix_factor = new ImuMixPriorFactor(preintegration_options_, mix_prior_, mix_prior_std_);
+        problem.AddResidualBlock(mix_factor, nullptr, statedatalist_[0].mix);
+    }
 }
 
 vector<std::pair<ceres::ResidualBlockId, GNSS *>> GVINS::addGnssFactors(ceres::Problem &problem, bool isusekernel) {
@@ -1862,4 +1900,31 @@ vector<std::pair<ceres::ResidualBlockId, GNSS *>> GVINS::addGnssFactors(ceres::P
     }
 
     return residual_block;
+}
+
+void GVINS::constructPrior(bool is_zero_velocity) {
+    double pos_prior_std  = 0.01;                                  // 0.01 m
+    double att_prior_std  = 0.5 * D2R;                             // 0.5 deg
+    double vel_prior_std  = 0.1;                                   // 0.1 m/s
+    double bg_prior_std   = integration_parameters_->gyr_bias_std; // Bias std
+    double ba_prior_std   = ACCELEROMETER_BIAS_PRIOR_STD;          // 1000 mGal
+    double sodo_prior_std = 0.001;                                 // 1000 PPM
+
+    if (!is_zero_velocity) {
+        bg_prior_std = GYROSCOPE_BIAS_PRIOR_STD; // 1000 deg/hr
+    }
+
+    memcpy(pose_prior_, statedatalist_[0].pose, sizeof(double) * 7);
+    memcpy(mix_prior_, statedatalist_[0].mix, sizeof(double) * 18);
+    for (size_t k = 0; k < 3; k++) {
+        pose_prior_std_[k + 0] = pos_prior_std;
+        pose_prior_std_[k + 3] = att_prior_std;
+
+        mix_prior_std_[k + 0] = vel_prior_std;
+        mix_prior_std_[k + 3] = bg_prior_std;
+        mix_prior_std_[k + 6] = ba_prior_std;
+    }
+    pose_prior_std_[5] = att_prior_std * 5;
+    mix_prior_std_[9]  = sodo_prior_std;
+    is_use_prior_      = true;
 }
