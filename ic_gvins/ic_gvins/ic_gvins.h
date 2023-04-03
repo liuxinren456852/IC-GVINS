@@ -125,7 +125,7 @@ private:
 
     // 动态航向初始的最小速度
     // Minimum velocity for GNSS/INS intializaiton
-    const double MINMUM_ALIGN_VELOCITY = 1.0;
+    const double MINMUM_ALIGN_VELOCITY = 0.5;
 
     // 允许的最小同步间隔
     // Minimum synchronization interval for GNSS
@@ -137,8 +137,8 @@ private:
 
     // 先验标准差
     // The prior STD for IMU biases
-    const double GYROSCOPE_BIAS_PRIOR_STD     = 1000 * D2R / 3600; // 1000 deg/hr
-    const double ACCELEROMETER_BIAS_PRIOR_STD = 1000 * 1.0e-5;     // 1000 mGal
+    const double GYROSCOPE_BIAS_PRIOR_STD     = 7200 * D2R / 3600; // 7200 deg/hr
+    const double ACCELEROMETER_BIAS_PRIOR_STD = 20000 * 1.0e-5;    // 20000 mGal
 
     // 优化参数, 使用deque容器管理, 移除头尾不会造成数据内存移动
     // The state data in the sliding window

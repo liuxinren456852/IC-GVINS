@@ -625,30 +625,32 @@ bool GVINS::gvinsInitialization() {
         is_has_zero_velocity = true;
     }
 
-    // 里程计速度大于MINMUM_ALIGN_VELOCITY, 或者非零速状态
+    // 非零速状态
     // Initialization conditions
-    Vector3d velocity = Vector3d::Zero();
-    if ((integration_config_.isuseodo && imu_buff.back().odovel > MINMUM_ALIGN_VELOCITY) || !is_zero_velocity) {
+    if (!is_zero_velocity) {
         if (last_gnss_.isyawvalid) {
             initatt[2] = last_gnss_.yaw;
             LOGI << "Initialized heading from dual-antenna GNSS as " << initatt[2] * R2D << " deg";
         } else {
-            velocity = gnss_.blh - last_gnss_.blh;
-            if (velocity.norm() < MINMUM_ALIGN_VELOCITY) {
+            Vector3d vel = gnss_.blh - last_gnss_.blh;
+            if (vel.norm() < MINMUM_ALIGN_VELOCITY) {
                 return false;
             }
 
             if (!is_has_zero_velocity) {
                 initatt[0] = 0;
-                initatt[1] = atan(-velocity.z() / sqrt(velocity.x() * velocity.x() + velocity.y() * velocity.y()));
+                initatt[1] = atan(-vel.z() / sqrt(vel.x() * vel.x() + vel.y() * vel.y()));
                 LOGI << "Initialized pitch from GNSS as " << initatt[1] * R2D << " deg";
             }
-            initatt[2] = atan2(velocity.y(), velocity.x());
+            initatt[2] = atan2(vel.y(), vel.x());
             LOGI << "Initialized heading from GNSS as " << initatt[2] * R2D << " deg";
         }
     } else {
         return false;
     }
+
+    // 从零速开始
+    Vector3d velocity = Vector3d::Zero();
 
     // 初始状态, 从上一秒开始
     // The initialization state
@@ -990,6 +992,10 @@ void GVINS::parametersStatistic() {
         }
         double avg_error = std::accumulate(errors.begin(), errors.end(), 0.0) / static_cast<double>(errors.size());
         reprojection_errors.emplace_back(avg_error);
+    }
+
+    if (reprojection_errors.empty()) {
+        reprojection_errors.push_back(0);
     }
 
     double min_error = *std::min_element(reprojection_errors.begin(), reprojection_errors.end());
@@ -1903,15 +1909,15 @@ vector<std::pair<ceres::ResidualBlockId, GNSS *>> GVINS::addGnssFactors(ceres::P
 }
 
 void GVINS::constructPrior(bool is_zero_velocity) {
-    double pos_prior_std  = 0.01;                                  // 0.01 m
-    double att_prior_std  = 0.5 * D2R;                             // 0.5 deg
-    double vel_prior_std  = 0.1;                                   // 0.1 m/s
-    double bg_prior_std   = integration_parameters_->gyr_bias_std; // Bias std
-    double ba_prior_std   = ACCELEROMETER_BIAS_PRIOR_STD;          // 1000 mGal
-    double sodo_prior_std = 0.001;                                 // 1000 PPM
+    double pos_prior_std  = 0.1;                                       // 0.1 m
+    double att_prior_std  = 0.5 * D2R;                                 // 0.5 deg
+    double vel_prior_std  = 0.1;                                       // 0.1 m/s
+    double bg_prior_std   = integration_parameters_->gyr_bias_std * 3; // Bias std * 3
+    double ba_prior_std   = ACCELEROMETER_BIAS_PRIOR_STD;              // 20000 mGal
+    double sodo_prior_std = 0.005;                                     // 5000 PPM
 
     if (!is_zero_velocity) {
-        bg_prior_std = GYROSCOPE_BIAS_PRIOR_STD; // 1000 deg/hr
+        bg_prior_std = GYROSCOPE_BIAS_PRIOR_STD; // 7200 deg/hr
     }
 
     memcpy(pose_prior_, statedatalist_[0].pose, sizeof(double) * 7);
@@ -1924,7 +1930,7 @@ void GVINS::constructPrior(bool is_zero_velocity) {
         mix_prior_std_[k + 3] = bg_prior_std;
         mix_prior_std_[k + 6] = ba_prior_std;
     }
-    pose_prior_std_[5] = att_prior_std * 5;
+    pose_prior_std_[5] = att_prior_std * 3; // heading
     mix_prior_std_[9]  = sodo_prior_std;
     is_use_prior_      = true;
 }

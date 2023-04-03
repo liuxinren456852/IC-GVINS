@@ -26,8 +26,7 @@
 #include "common/logging.h"
 #include "common/rotation.h"
 
-#include <omp.h>
-#include <opencv2/core/eigen.hpp>
+#include <tbb/tbb.h>
 #include <yaml-cpp/yaml.h>
 
 Tracking::Tracking(Camera::Ptr camera, Map::Ptr map, Drawer::Ptr drawer, const string &configfile,
@@ -319,7 +318,7 @@ bool Tracking::doResetTracking() {
     if (!frame_cur_->numFeatures()) {
         isinitializing_ = true;
         frame_ref_      = frame_cur_;
-        pts2d_cur_.clear();
+        pts2d_new_.clear();
         pts2d_ref_.clear();
         pts2d_ref_frame_.clear();
         velocity_ref_.clear();
@@ -378,7 +377,7 @@ bool Tracking::trackMappoint() {
     // 预测的特征点像素坐标添加畸变, 用于跟踪
     camera_->distortPoints(pts2d_matched);
 
-    vector<uint8_t> status, statue_reverse;
+    vector<uint8_t> status, status_reverse;
     vector<float> error;
     vector<cv::Point2f> pts2d_reverse = pts2d_map;
 
@@ -388,14 +387,14 @@ bool Tracking::trackMappoint() {
                              cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01),
                              cv::OPTFLOW_USE_INITIAL_FLOW);
     // 反向光流
-    cv::calcOpticalFlowPyrLK(frame_cur_->image(), frame_pre_->image(), pts2d_matched, pts2d_reverse, statue_reverse,
+    cv::calcOpticalFlowPyrLK(frame_cur_->image(), frame_pre_->image(), pts2d_matched, pts2d_reverse, status_reverse,
                              error, cv::Size(21, 21), TRACK_PYRAMID_LEVEL,
                              cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01),
                              cv::OPTFLOW_USE_INITIAL_FLOW);
 
     // 跟踪失败的
     for (size_t k = 0; k < status.size(); k++) {
-        if (status[k] && statue_reverse[k] && !isOnBorder(pts2d_matched[k]) &&
+        if (status[k] && status_reverse[k] && !isOnBorder(pts2d_matched[k]) &&
             (ptsDistance(pts2d_reverse[k], pts2d_map[k]) < 0.5)) {
             status[k] = 1;
         } else {
@@ -480,7 +479,7 @@ bool Tracking::trackReferenceFrame() {
     }
 
     // 跟踪参考帧
-    vector<uint8_t> status, statue_reverse;
+    vector<uint8_t> status, status_reverse;
     vector<float> error;
     vector<cv::Point2f> pts2d_reverse = pts2d_new_;
 
@@ -491,14 +490,14 @@ bool Tracking::trackReferenceFrame() {
                              cv::OPTFLOW_USE_INITIAL_FLOW);
 
     // 反向光流
-    cv::calcOpticalFlowPyrLK(frame_cur_->image(), frame_pre_->image(), pts2d_cur_, pts2d_new_, statue_reverse, error,
+    cv::calcOpticalFlowPyrLK(frame_cur_->image(), frame_pre_->image(), pts2d_cur_, pts2d_reverse, status_reverse, error,
                              cv::Size(21, 21), TRACK_PYRAMID_LEVEL,
                              cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01),
                              cv::OPTFLOW_USE_INITIAL_FLOW);
 
     // 剔除跟踪失败的, 正向反向跟踪在0.5个像素以内
     for (size_t k = 0; k < status.size(); k++) {
-        if (status[k] && statue_reverse[k] && !isOnBorder(pts2d_cur_[k]) &&
+        if (status[k] && status_reverse[k] && !isOnBorder(pts2d_cur_[k]) &&
             (ptsDistance(pts2d_reverse[k], pts2d_new_[k]) < 0.5)) {
             status[k] = 1;
         } else {
@@ -625,35 +624,36 @@ void Tracking::featuresDetection(Frame::Ptr &frame, bool ismask) {
     cv::Size zero_zone         = cv::Size(-1, -1);
     cv::TermCriteria term_crit = cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 20, 0.01);
 
-#pragma omp parallel for num_threads(3) default(none)                                                                  \
-    shared(frame, mask, features_cnts, block_features, win_size, zero_zone, term_crit)
-    for (int k = 0; k < block_cnts_; k++) {
-        int blocl_track_num = track_max_block_features_ - features_cnts[k];
-        if (blocl_track_num > 0) {
+    auto tracking_function = [&](const tbb::blocked_range<int> &range) {
+        for (int k = range.begin(); k != range.end(); k++) {
+            int blocl_track_num = track_max_block_features_ - features_cnts[k];
+            if (blocl_track_num > 0) {
 
-            int cols = k % block_cols_;
-            int rows = k / block_cols_;
+                int cols = k % block_cols_;
+                int rows = k / block_cols_;
 
-            int col_sta = cols * block_indexs_[0].first;
-            int col_end = col_sta + block_indexs_[0].first;
-            int row_sta = rows * block_indexs_[0].second;
-            int row_end = row_sta + block_indexs_[0].second;
-            if (k != (block_cnts_ - 1)) {
-                col_end -= 5;
-                row_end -= 5;
-            }
+                int col_sta = cols * block_indexs_[0].first;
+                int col_end = col_sta + block_indexs_[0].first;
+                int row_sta = rows * block_indexs_[0].second;
+                int row_end = row_sta + block_indexs_[0].second;
+                if (k != (block_cnts_ - 1)) {
+                    col_end -= 5;
+                    row_end -= 5;
+                }
 
-            Mat block_image = frame->image().colRange(col_sta, col_end).rowRange(row_sta, row_end);
-            Mat block_mask  = mask.colRange(col_sta, col_end).rowRange(row_sta, row_end);
+                Mat block_image = frame->image().colRange(col_sta, col_end).rowRange(row_sta, row_end);
+                Mat block_mask  = mask.colRange(col_sta, col_end).rowRange(row_sta, row_end);
 
-            cv::goodFeaturesToTrack(block_image, block_features[k], blocl_track_num, 0.01, track_min_pixel_distance_,
-                                    block_mask);
-            if (!block_features[k].empty()) {
-                // 获取亚像素角点
-                cv::cornerSubPix(block_image, block_features[k], win_size, zero_zone, term_crit);
+                cv::goodFeaturesToTrack(block_image, block_features[k], blocl_track_num, 0.01,
+                                        track_min_pixel_distance_, block_mask);
+                if (!block_features[k].empty()) {
+                    // 获取亚像素角点
+                    cv::cornerSubPix(block_image, block_features[k], win_size, zero_zone, term_crit);
+                }
             }
         }
-    }
+    };
+    tbb::parallel_for(tbb::blocked_range<int>(0, block_cnts_), tracking_function);
 
     // 调整角点的坐标
     int num_new_features = 0;
@@ -702,6 +702,7 @@ bool Tracking::triangulation() {
     int num_succeeded = 0;
     int num_outlier   = 0;
     int num_reset     = 0;
+    int num_outtime   = 0;
 
     // 原始带畸变的角点
     auto pts2d_ref_undis = pts2d_ref_;
@@ -728,15 +729,15 @@ bool Tracking::triangulation() {
             continue;
         }
 
-        pose0 = frame_ref->pose();
-
         // 移除长时间跟踪导致参考帧已经不在窗口内的观测
-        if (map_->isWindowFull() && !map_->isKeyFrameInMap(frame_ref)) {
+        if (map_->isWindowNormal() && !map_->isKeyFrameInMap(frame_ref)) {
             status.push_back(0);
+            num_outtime++;
             continue;
         }
 
         // 进行必要的视差检查, 保证三角化有效
+        pose0           = frame_ref->pose();
         double parallax = keyPointParallax(pts2d_ref_undis[k], pts2d_cur_undis[k], pose0, pose1);
         if (parallax < TRACK_MIN_PARALLAX) {
             status.push_back(1);
@@ -792,7 +793,7 @@ bool Tracking::triangulation() {
     pts2d_new_ = pts2d_cur_;
 
     LOGI << "Triangulate " << num_succeeded << " 3D points with " << pts2d_cur_.size() << " left, " << num_reset
-         << " reset and " << num_outlier << " outliers";
+         << " reset, " << num_outtime << " outtime and " << num_outlier << " outliers";
     return true;
 }
 
